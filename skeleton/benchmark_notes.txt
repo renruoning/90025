@@ -291,6 +291,67 @@ plus contention outweighs any parallelism gained, and switching away from
 array-indexed bookkeeping to hash maps made the constant-factor problem
 worse on top of that. Not pursuing further locking-based variants.
 
+Optimization attempt #5 (v3) -- batch the round's "own pair" removal
+(src/parallel_task2_v3.cpp, separate experimental file, NOT wired into the
+real parallel_task2 entry point; based on v1's array/group design, not v2's
+hash-map one, 2026-09-12): every occurrence pays a
+remove_edge(state, position, frequency) to remove the CURRENT round's own
+pair (left_token,right_token). By R5.4 (overlapping occurrences merge
+left-to-right, exhaustively), every word that merges at least once this
+round necessarily drains ALL its live edges of that pair -- so instead of
+discovering that per occurrence, aggregate total_frequency and
+"distinct words that merged >=1 time" (both via OpenMP reduction, same
+trick as the token_count optimization) and apply ONE update to the
+pair_state, recycling each word's group (captured once, from its first
+successful occurrence) directly instead of through remove_edge.
+
+Bug found and fixed during verification: the batching assumed a word's
+group for its own pair is ONLY ever touched by remove_edge(position) calls
+(the ones being batched away). That's false for a SELF-PAIR round
+(left_token == right_token, e.g. merging (a,a) inside "aaaa"): an
+overlapping occurrence's right_position removal can target the exact same
+group, because right_position's forward pair (right_token, after_token)
+coincides with (left_token,right_token) exactly when right_token ==
+left_token. ParallelTask2V3Diff.ManyWordsWithInternalOverlap caught this
+immediately (abort: pair.count underflow) -- diagnosed via targeted
+fprintf instrumentation at each remove_edge abort site (not just guessing).
+Fix: detect self-pair rounds (left_token==right_token) and bypass the
+batching entirely for those, falling back to the same per-occurrence
+remove_edge(position) the non-batched design uses (MergeEvent gained a
+needs_own_removal flag). All other (non-self-pair) rounds still use the
+batched path. Re-tested: 74/74 tests pass, stable across 1-16 threads and
+5 repeats at 16 threads.
+
+Performance: modest and scenario-dependent, NOT a clear win the way the
+token_count optimization was.
+  - On the 150k-word corpus (mostly 1 occurrence per word, the common
+    case): v3 is roughly on par with v1, if anything slightly worse (both
+    measured with the same standalone driver, interleaved, back-to-back --
+    v1 avg ~214ms @8 threads, v3 avg ~225ms @8 threads over 5 runs). Makes
+    sense: when words rarely contribute more than one occurrence, there's
+    little to batch, and the extra own_groups bookkeeping is pure overhead.
+  - On a corpus designed for the case this optimization targets (30000
+    distinct words, each a 20-char repeated run, so many occurrences
+    cluster within few words per round): v3 was faster (57ms vs 59ms @1
+    thread, ~93ms vs ~104ms @8 threads, roughly 10% at 8 threads) but
+    still nowhere near a transformative win, and single-sample (not
+    repeated enough to rule out noise given the WSL host's load appears to
+    have drifted over this long session -- see the note below).
+  IMPORTANT CAVEAT: earlier numbers reported for v1 in this session
+  (~280ms @1 thread, ~500-677ms @8 threads on the 150k-word corpus) were
+  measured hours before v3's numbers, and a fresh, same-instant v1
+  re-measurement with the same driver came back at ~138-225ms across
+  thread counts -- meaning the WSL host's background load changed
+  significantly over the course of this session, and any comparison across
+  measurements taken far apart in time is unreliable. Only the
+  interleaved, same-sitting comparisons above (v1 vs v3 back-to-back) are
+  trustworthy; anything compared against the much-earlier v1 numbers
+  elsewhere in this log should be treated as directional only, not exact.
+  This is itself worth writing up in the report's methodology/limitations
+  discussion (measurement protocol matters, single-run numbers on a shared/
+  noisy machine are not reliable -- exactly why Spartan's dedicated
+  interactive nodes, with repeated runs, are what actually counts).
+
 ===========================================================
 3. Test corpora used (local, not committed to git)
 ===========================================================
@@ -339,13 +400,36 @@ Real data used for correctness/perf on Spartan:
       but task2 alone is SLOWER at 8 threads (3267ms -> 3651ms, 0.90x) —
       see section 2(c). This is worse than the 10M.txt result, so the
       regression grows with scale.
-- [ ] REQUIRED, not optional anymore: implement the token_count/group_count
-      parallel-phase optimization described in section 2 before doing
-      anything else on Task2 — confirmed on real 100M.txt data that task2
-      as currently implemented would score 0 on the speed rubric.
+- [x] token_count moved to the parallel phase via OpenMP reduction (commit
+      e95e29d) — small, safe, verified win. group_count/pair_state
+      splitting was attempted twice more (see attempts #2 and #5 above):
+      #2 (naively split remove_edge from add_edge) was reverted, correctness
+      bug. #5 (batch only the round's own-pair removal, with a self-pair
+      guard) is landed as a SEPARATE experimental file
+      (src/parallel_task2_v3.cpp), correctness-verified, but the local
+      performance win is modest/scenario-dependent, not the "required" fix
+      100M.txt demanded — see attempt #5 above for numbers and caveats.
+- [x] Raised kParallelThreshold 2000->20000 (commit b4b1203) — real,
+      verified local improvement (roughly halves the regression on the
+      150k-word corpus). Still not a net win over sequential locally.
+- [ ] STILL NEEDED: real Spartan numbers for both the threshold=20000
+      tuning (only tested with a genuine dedicated node once so far, on
+      10M.txt: 538ms @1 thread vs 750-1000ms @8 threads, i.e. still a
+      regression) and for parallel_task2_v3 (completely untested on
+      Spartan as of writing -- only local WSL numbers exist, and this
+      session's local numbers turned out to be unreliable across
+      well-separated measurements, see attempt #5's caveat). Whoever picks
+      this up next should prioritize: (1) confirm v1 (threshold=20000, the
+      version actually wired into parallel_task2) on a dedicated Spartan
+      node across 10M.txt AND 100M.txt, multiple thread counts, a few
+      repeats each; (2) only then decide whether v3 is worth wiring in for
+      a similar real-data test, given its local signal is weak.
 - [ ] Sweep OMP_NUM_THREADS = 1/2/4/8/16/32 on 10M.txt and 100M.txt on
       Spartan for task2 specifically (only have 1 vs 8 on both so far).
-- [ ] Task3: benchmark.slurm SBATCH header is still a placeholder, not filled in.
+- [x] Task3: benchmark.slurm SBATCH header filled in (commit 211124e),
+      partition switched cascade->sapphire per Spartan's own
+      recommendation (commit 453e0b8). NOT yet run to completion on
+      Spartan / results.csv not yet inspected as of writing.
 - [x] tests/test_parallel_task2_diff.cpp's RealisticMixedCorpus and
       DiverseVocabularyCorpus cases depended on external files (stress.txt/
       stress2.txt) that were never in the repo — confirmed failing on
