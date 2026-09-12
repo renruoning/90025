@@ -20,7 +20,6 @@ namespace bpe {
         constexpr u32 no_position = std::numeric_limits<u32>::max();
         constexpr u32 byte_value_count = 256;
         constexpr std::size_t kParallelThreshold = 2000;
-    }
 u64 pack_pair(u32 left, u32 right) {
     return (static_cast<u64>(left) << 32) | static_cast<u64>(right);
 }
@@ -485,7 +484,7 @@ void process_positions_parallel(task2_state& state, const std::vector<u32>& posi
     for(const auto& entry:by_word){
         active_words.push_back(entry.first);
     }
-    const int num_gthreads=omp_get_max_threads();
+    const int num_threads=omp_get_max_threads();
     std::vector<std::vector<MergeEvent>> local_events(num_threads);
 
     #pragma omp parallel
@@ -663,4 +662,4 @@ void parallel_task2(const std::vector<CharSplit>& splits, Results& results) {
     finalize_results(state, results);
 }
 
-}  // namespace bpe
+} 
