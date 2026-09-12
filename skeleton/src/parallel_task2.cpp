@@ -487,13 +487,20 @@ void process_positions_parallel(task2_state& state, const std::vector<u32>& posi
     const int num_threads=omp_get_max_threads();
     std::vector<std::vector<MergeEvent>> local_events(num_threads);
 
+    // token_count[left_token]/[right_token]/[merged_token] only ever move by
+    // "frequency" per successful merge, for the same three token ids for the
+    // whole round -- that's a plain sum, safe to accumulate as an OpenMP
+    // reduction instead of touching the shared state.token_count array once
+    // per event in the sequential replay below.
+    u64 total_frequency = 0;
+
     #pragma omp parallel
     {
         const int tid = omp_get_thread_num();
         std::vector<MergeEvent>& events = local_events[tid];
         events.reserve(positions.size() / static_cast<std::size_t>(num_threads) + 16);
 
-        #pragma omp for schedule(dynamic, 64)
+        #pragma omp for schedule(dynamic, 64) reduction(+:total_frequency)
         for (std::size_t idx = 0; idx < active_words.size(); ++idx) {
             const u32 word = active_words[idx];
             const u64 frequency = state.word_frequencies[word];
@@ -536,10 +543,15 @@ void process_positions_parallel(task2_state& state, const std::vector<u32>& posi
                                      ? state.token[ev.after_position]
                                      : no_position;
 
+                total_frequency += frequency;
                 events.push_back(ev);
             }
         }
     }
+
+    state.token_count[left_token] -= total_frequency;
+    state.token_count[right_token] -= total_frequency;
+    state.token_count[merged_token] += total_frequency;
 
     for (const std::vector<MergeEvent>& events : local_events) {
         for (const MergeEvent& ev : events) {
@@ -552,10 +564,6 @@ void process_positions_parallel(task2_state& state, const std::vector<u32>& posi
             } else {
                 state.edge_group[ev.right_position] = no_position;
             }
-
-            state.token_count[left_token] -= ev.frequency;
-            state.token_count[right_token] -= ev.frequency;
-            state.token_count[merged_token] += ev.frequency;
 
             if (ev.left_position != no_position) {
                 const u32 state_id =
