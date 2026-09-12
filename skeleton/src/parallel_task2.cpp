@@ -19,7 +19,7 @@ namespace bpe {
         using u64=std::uint64_t;
         constexpr u32 no_position = std::numeric_limits<u32>::max();
         constexpr u32 byte_value_count = 256;
-        constexpr std::size_t kParallelThreshold = 2000;
+        constexpr std::size_t kParallelThreshold = 20000;
 u64 pack_pair(u32 left, u32 right) {
     return (static_cast<u64>(left) << 32) | static_cast<u64>(right);
 }

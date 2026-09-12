@@ -219,6 +219,38 @@ test suite immediately — ParallelTask2Diff.ManyWordsWithInternalOverlap
   bigger restructuring than "promote a decrement", not a small increment.
   Left as a bigger future task, not attempted again this session.
 
+Optimization attempt #3 — raise kParallelThreshold from 2000 to 20000
+(landed, commit pending, 2026-09-12): tuning-only change, zero correctness
+risk (doesn't touch program semantics, only the round-size cutoff for
+"go parallel vs fall back to sequential"). Tried schedule(static) instead
+of schedule(dynamic, 64) first -- no real difference (~550ms @8 threads on
+the 150k-word corpus, same as dynamic). Then swept kParallelThreshold:
+
+  threshold | task2 @1 thread | task2 @8 threads | ratio
+  ----------|-----------------|-------------------|------
+  2000      | ~280 ms          | ~500-677 ms        | ~1.8-2.4x slower
+  20000     | ~271-289 ms      | ~337-353 ms        | ~1.2x slower
+  60000     | ~280-300 ms      | ~348-414 ms         | ~1.2-1.4x slower (noisier, no better than 20000)
+
+  20000 and 60000 land in the same ballpark; picked 20000 (smaller, so it
+  still exercises the parallel path on inputs that don't have 60000+
+  occurrences in a single round -- matters for demonstrating genuine
+  parallelism per R7.2, not just for raw speed).
+
+  This is real progress -- cuts the regression roughly in half -- but is
+  NOT a fix, just damage control: task2 is still measurably slower than
+  sequential on the 150k-word local corpus. Confirms the earlier finding
+  that mid-sized rounds (a few thousand to ~20000 positions) are where the
+  parallel path loses the most; only genuinely huge rounds come close to
+  breaking even locally. Real Spartan numbers with this threshold are
+  still needed (couldn't test -- off campus, no VPN) before trusting this
+  generalizes to 10M.txt/100M.txt.
+  Also bumped up the two synthetic ParallelTask2Diff corpora
+  (LargeDistinctWordsForcesParallelRound 5000->25000 words,
+  ManyWordsWithInternalOverlap 3000->8000 words) so they still clear the
+  new, higher threshold and keep exercising process_positions_parallel
+  instead of silently falling back to sequential.
+
 
 ===========================================================
 3. Test corpora used (local, not committed to git)

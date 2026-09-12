@@ -57,18 +57,23 @@ TEST(ParallelTask2Diff, MultipleRounds) {
 }
 
 TEST(ParallelTask2Diff, LargeDistinctWordsForcesParallelRound) {
+    // Must stay comfortably above kParallelThreshold in parallel_task2.cpp
+    // (currently 20000) so this still exercises process_positions_parallel,
+    // not just the sequential fallback.
     std::vector<bpe::CharSplit> splits;
-    splits.reserve(5000);
-    for (int i = 0; i < 5000; ++i) {
+    splits.reserve(25000);
+    for (int i = 0; i < 25000; ++i) {
         splits.push_back(cs("ab" + std::to_string(i), 1));
     }
     expect_same(splits);
 }
 
 TEST(ParallelTask2Diff, ManyWordsWithInternalOverlap) {
+    // 3 occurrences of (a,a) per word, so needs >~7000 words to clear
+    // kParallelThreshold in the very first round.
     std::vector<bpe::CharSplit> splits;
-    splits.reserve(3000);
-    for (int i = 0; i < 3000; ++i) {
+    splits.reserve(8000);
+    for (int i = 0; i < 8000; ++i) {
         splits.push_back(cs("aaaa" + std::to_string(i % 7), 3));
     }
     expect_same(splits);
