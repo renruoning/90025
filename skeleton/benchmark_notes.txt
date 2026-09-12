@@ -252,6 +252,45 @@ the 150k-word corpus, same as dynamic). Then swept kParallelThreshold:
   instead of silently falling back to sequential.
 
 
+Optimization attempt #4 (v2) -- full rewrite: hash-map registry + critical
+section, interleaved remove+add (src/parallel_task2_v2.cpp, kept as a
+separate experimental file, NOT wired into the real parallel_task2 entry
+point, 2026-09-12): dropped the group/free-list system entirely. Each pair
+is a direct unordered_map<u64,PairRecord> entry; PairRecord carries its own
+unordered_map<word,live_edge_count>, so no group indices/free list at all.
+remove+add are kept interleaved per occurrence (fixes the attempt #2 bug by
+construction -- they're never split across the parallel/sequential
+boundary), with the shared registry protected by a single
+`#pragma omp critical(pair_registry)` around each of the two bookkeeping
+blocks; the structural linked-list surgery stays lock-free and parallel,
+same as v1.
+
+Correctness: verified via a parallel differential test suite
+(tests/test_parallel_task2_v2_diff.cpp, mirrors the v1 one) -- all cases
+pass, including 5 repeats at 16 threads with no flakiness. The design is
+correct.
+
+Performance: WORSE than v1 at every thread count tested, including
+single-threaded (150k-word local corpus, task2_v2 standalone driver):
+  threads | task2_v2
+  --------|----------
+  1       | 1291 ms   (v1 same corpus: ~280 ms -- ~4.6x slower at 1 thread)
+  2       | 1425 ms
+  4       | 1528 ms
+  8       | 1668 ms   (gets WORSE with more threads, confirming lock
+                        contention is real, not just theoretical)
+Two independent causes stacked: (a) the nested unordered_map word_edges
+design has real per-operation overhead (hash + allocation) compared to
+v1's O(1) array-indexed group/free-list, so even the *sequential* baseline
+is much slower; (b) the critical section is entered on essentially every
+remove/add call (not just rare ones), so lock overhead scales with thread
+count rather than being amortized away. Net conclusion: locking-based
+designs are very unlikely to beat "defer everything, replay lock-free and
+single-threaded" (v1's strategy) for this problem -- the lock's fixed cost
+plus contention outweighs any parallelism gained, and switching away from
+array-indexed bookkeeping to hash maps made the constant-factor problem
+worse on top of that. Not pursuing further locking-based variants.
+
 ===========================================================
 3. Test corpora used (local, not committed to git)
 ===========================================================
