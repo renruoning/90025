@@ -236,9 +236,11 @@ Real data used for correctness/perf on Spartan:
 - [ ] Sweep OMP_NUM_THREADS = 1/2/4/8/16/32 on 10M.txt and 100M.txt on
       Spartan for task2 specifically (only have 1 vs 8 on both so far).
 - [ ] Task3: benchmark.slurm SBATCH header is still a placeholder, not filled in.
-- [ ] tests/test_parallel_task2_diff.cpp's RealisticMixedCorpus and
-      DiverseVocabularyCorpus cases depend on external files (stress.txt/
-      stress2.txt) that are NOT in the repo — will fail with "file not
-      found" for anyone else (including graders) who tries to run them.
-      Either commit the corpora under tests/data/ with relative paths, or
-      drop those two test cases and rely on the self-contained ones.
+- [x] tests/test_parallel_task2_diff.cpp's RealisticMixedCorpus and
+      DiverseVocabularyCorpus cases depended on external files (stress.txt/
+      stress2.txt) that were never in the repo — confirmed failing on
+      Spartan with "file not found" (2026-09-12), exactly as predicted.
+      Removed both test cases; the remaining 6 self-contained
+      ParallelTask2Diff cases (including the 5000/3000-word synthetic
+      corpora built inline) still cover the parallel code path without any
+      external file dependency.

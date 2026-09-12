@@ -73,25 +73,3 @@ TEST(ParallelTask2Diff, ManyWordsWithInternalOverlap) {
     }
     expect_same(splits);
 }
-
-TEST(ParallelTask2Diff, RealisticMixedCorpus) {
-    std::vector<bpe::Byte> input =
-        bpe::read_file("/tmp/claude-1000/-home-ruoningr-90025/"
-                       "24cd59c2-42bc-4db2-8488-c76509e48cd6/scratchpad/"
-                       "stress.txt");
-    const std::vector<bpe::Word> words = bpe::split_words(input);
-    bpe::Results r;
-    bpe::task1(words, r);
-    expect_same(r.char_splits);
-}
-
-TEST(ParallelTask2Diff, DiverseVocabularyCorpus) {
-    std::vector<bpe::Byte> input =
-        bpe::read_file("/tmp/claude-1000/-home-ruoningr-90025/"
-                       "24cd59c2-42bc-4db2-8488-c76509e48cd6/scratchpad/"
-                       "stress2.txt");
-    const std::vector<bpe::Word> words = bpe::split_words(input);
-    bpe::Results r;
-    bpe::task1(words, r);
-    expect_same(r.char_splits);
-}
