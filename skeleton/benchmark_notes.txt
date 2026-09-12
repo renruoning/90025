@@ -1,0 +1,244 @@
+COMP90025 Project 1 (BPE) — Benchmark & Testing Log
+=====================================================
+Kept as a running record for report-writing later. Append new results at the
+bottom rather than overwriting old ones.
+
+
+===========================================================
+1. Task1 (parallel_split_words + word-frequency counting V2)
+===========================================================
+
+Design:
+- split_words parallelized in two passes:
+  (a) #pragma omp parallel for over every byte, independently replacing
+      separators with '\0' (no cross-iteration dependency).
+  (b) each thread scans its own contiguous byte range for word starts into
+      a thread-local vector; results concatenated in thread order to
+      preserve left-to-right ordering.
+- Word counting: each thread accumulates into its own
+  unordered_map<string_view, size_t> over a static split of the word list,
+  then a sequential merge folds all local maps into one. No global sort
+  (Ed clarification: Task1's word_counts/char_splits order is unspecified;
+  only Task2's output.txt must be sorted/byte-exact).
+
+Correctness:
+- 52/52 unit tests pass (make test) after updating test_pipeline.cpp's
+  order-dependent assertion (see git history).
+- make smoke on Spartan: both 10M.txt and 100M.txt passed (md5 matched the
+  locked baseline) — confirms output.txt byte-exact on real data, not just
+  the toy fixtures.
+
+Spartan timing, 10M.txt (from /data/gpfs/projects/punim0520/2026/project1/),
+with parallel_task2 still a stub calling the sequential task2 at this point:
+
+  threads | split words | task1 (split+count+charsplit) | task2 (seq stub) | total    | peak mem
+  --------|-------------|-------------------------------|-------------------|----------|----------
+    1     |   63 ms     |   208 ms                       |   489 ms          |  697 ms  | 116 MB
+    4     |   31 ms     |   120 ms                       |   484 ms          |  604 ms  | 128 MB
+    8     |   23 ms     |   111 ms                       |   478 ms          |  590 ms  | 132 MB
+
+  Speedup @4 threads: split words 2.03x, task1 1.73x
+  Speedup @8 threads: split words 2.74x, task1 1.87x
+  (sub-linear, diminishing returns 4->8 — likely unordered_map allocation/
+  rehash overhead becomes proportionally larger as per-thread work shrinks)
+
+  task2 flat across thread counts here because it was still the sequential
+  stub (parallel_task2 not implemented yet at this point).
+
+  md5 of output.txt identical across all thread counts:
+  437efd507a4ce4ca82956f062fa9c2b2  (10M.txt)
+
+
+===========================================================
+2. Task2 (parallel_task2 — word-bucketed round processing)
+===========================================================
+
+Design (see src/parallel_task2.cpp):
+- Round-to-round (which pair to merge next) stays strictly sequential —
+  inherent to the greedy algorithm, cannot be parallelized without changing
+  results.
+- Within one round, if positions.size() >= kParallelThreshold (2000) and
+  more than 1 OpenMP thread is available:
+    Phase 1 (parallel, bucketed by word via unordered_map<word, vector<pos>>):
+      each thread processes its assigned words' occurrences in original
+      order, doing ONLY the word-local linked-list surgery (token/next/
+      previous/alive arrays — safe because each word owns a disjoint index
+      range) and records a MergeEvent per successful merge (capturing
+      left_token/after_token AT the time of mutation, not re-derived later).
+    Phase 2 (sequential replay): every MergeEvent is replayed through the
+      *unmodified* remove_edge/add_edge/get_left_pair_state/
+      get_right_pair_state helpers (same functions task2.cpp's sequential
+      path uses), applying the cross-word-shared pair_state/group
+      bookkeeping that can't safely be done in parallel.
+  Below the threshold, falls back to process_positions_sequential (byte-
+  identical to the reference inner loop) to avoid thread overhead on small
+  rounds.
+
+Bug found & fixed during verification (2026-09-12):
+  The parallel structural phase originally cleared
+  state.edge_group[right_position] = no_position immediately (copied
+  verbatim from the sequential reference's ordering). But that field is
+  read by the DEFERRED remove_edge(state, right_position, ...) call in the
+  sequential replay phase, which needs it to find which pair_state's count
+  to decrement. Clearing it early destroys that information before replay
+  can use it, triggering the internal std::abort() safety check ("group ==
+  no_position"). Fix: leave edge_group[right_position] untouched in the
+  parallel phase; remove_edge clears it itself as its last step when
+  called, and it is only cleared manually in the replay phase for the case
+  where after_position is not live (so remove_edge is never called on it).
+
+Correctness verification (tests/test_parallel_task2_diff.cpp):
+  Differential test comparing task2() (sequential reference) against
+  parallel_task2() bit-for-bit on the same CharSplit input, across:
+    - all edge cases from test_task2.cpp (empty corpus, single word,
+      HuggingFace example, tie-break, overlapping occurrences, multi-round,
+      etc.)
+    - a synthetic 5000-distinct-word corpus ("ab0".."ab4999") to force the
+      very first round through the parallel path
+    - a synthetic 3000-word corpus with internal pair overlap ("aaaa0" etc.)
+      to stress the same-word overlapping-merge logic under the parallel
+      dispatch
+    - two corpora built from real split_words+task1 output (see section 3)
+  Result: PASS on all cases, re-run 3x each at OMP_NUM_THREADS = 1, 2, 3, 4,
+  8, 16 with no flakiness observed.
+
+  On Spartan, 10M.txt output md5 with the real parallel_task2 (not the
+  stub) also matches the earlier stub-recorded baseline
+  (437efd507a4ce4ca82956f062fa9c2b2) — independent confirmation on a large
+  real corpus, not just synthetic/unit-test fixtures.
+
+  100M.txt output md5 (3581e913ac4c3f85000e8f8c933c8037) also matches the
+  locked baseline at both 1 and 8 threads (2026-09-12) — correctness holds
+  at the larger scale too.
+
+Performance — WARNING, not a clean win yet:
+
+  (a) Synthetic worst case, 150,007 distinct words ("wordN" + a handful of
+      common filler words), local WSL machine:
+        threads | task2 time
+        --------|------------
+          1      |  277-280 ms
+          2      |  539-612 ms
+          4      |  501-642 ms
+          8      |  508-677 ms
+      SLOWER with more threads. Root cause: the sequential replay phase's
+      work is roughly comparable in size to the parallelizable structural
+      phase, so Amdahl's law caps the win, and on this corpus (near-zero
+      shared structure between words) the parallel phase barely helps while
+      still paying bucketing/event-storage overhead.
+      Two mitigations applied (both real improvements, neither fixed the
+      regression on this specific corpus):
+        - bucket positions by word using unordered_map instead of a vector
+          sized to the whole vocabulary (the original version allocated a
+          150,000-entry vector of vectors on every large round — dominant
+          cost before the fix)
+        - schedule(dynamic, 64) instead of schedule(dynamic) + events.reserve()
+          per thread, to cut per-iteration scheduling overhead when many
+          words contribute just one occurrence each
+
+  (b) Real 10M.txt on Spartan, 126,860 distinct words (much more realistic
+      pair-frequency distribution than (a)'s synthetic corpus):
+        threads | task2 time | speedup
+        --------|------------|--------
+          1      |  597 ms    | 1.00x
+          8      |  444 ms    | 1.34x
+      A real, if modest, win — likely because real text has a much more
+      skewed (Zipfian) pair-frequency distribution than the synthetic
+      "wordN" corpus, so the big early rounds amortize the parallel phase
+      better. Per the subject's speed-grading curve (H1 ~ O(p/log p) > H2 ~
+      O(sqrt n) > H3 some speedup > P barely faster than baseline), 1.34x @
+      8 threads is probably only H3-tier, not competitive yet.
+
+  (c) Real 100M.txt on Spartan, 702,425 distinct words (2026-09-12):
+        threads | task2 time | speedup
+        --------|------------|--------
+          1      |  3267 ms   | 1.00x
+          8      |  3651 ms   | 0.90x  (SLOWER)
+      Confirms (a) was not an artifact of the synthetic corpus: the
+      regression gets WORSE as the corpus (and vocabulary) grows, not
+      better. task1 still wins nicely at this scale (656->341ms split
+      words = 1.92x, 2885->1746ms task1 = 1.65x), so total pipeline time is
+      still down 6152->5398ms (1.14x), but task2 in isolation is a genuine
+      regression at this scale and would very likely score 0 on the
+      speed rubric ("slower than sequential baseline") as currently
+      implemented. This makes the token_count/group_count optimization
+      below no longer optional — it's required before submission, not a
+      nice-to-have.
+      md5 (3581e913ac4c3f85000e8f8c933c8037) matched the locked baseline at
+      both thread counts — correctness still solid, only speed is the
+      problem.
+
+Next optimization planned (not yet implemented):
+  Promote token_count increments/decrements and group_count decrements into
+  the parallel phase directly (verified safe: token_count updates are purely
+  additive per token id and can be accumulated as local deltas or done with
+  an atomic; group ids are exclusively owned by one (pair_state, word) pair
+  so decrementing an EXISTING group's count from the owning word's thread
+  never races with another word). Leave only the genuinely cross-word-shared
+  fields — pair.count, pair.word_count, free_head, and new pair_state/
+  vocabulary/group vector growth — in the sequential replay. This should
+  shrink the sequential phase's share of total work and push the speedup
+  curve up, since Amdahl's law is the main thing currently capping it.
+
+
+===========================================================
+3. Test corpora used (local, not committed to git)
+===========================================================
+Generated under this session's scratchpad
+(/tmp/claude-1000/-home-ruoningr-90025/24cd59c2-42bc-4db2-8488-c76509e48cd6/scratchpad/)
+— NOT part of the repo, will disappear when the session/machine is cleaned up.
+If any of these numbers need to be reproduced later, regenerate with:
+
+  stress.txt  (1.2 MB): 200,000 tokens drawn from a 20-word vocabulary
+    (the/quick/brown/fox/... + banana/apple/application/... + aardvark/xyz).
+    python3 -c "
+    import random; random.seed(42)
+    vocab = ['the','quick','brown','fox','jumps','over','lazy','dog','banana',
+             'apple','application','applications','aardvark','a','an','and',
+             'anaconda','ababab','xyz','xyzzy']
+    print(' '.join(random.choice(vocab) for _ in range(200000)))
+    " > stress.txt
+
+  stress2.txt (277 KB): 6000 words "ab0".."ab5999" + 4000 words
+    "the0".."the49" repeated + 50,000 draws from a 8-word common list,
+    shuffled. Forces large parallel rounds via real split_words+task1
+    (6058 distinct words in Task1 output).
+
+  stress3.txt (2.4 MB): 150,000 distinct "wordN" words + 300,000 draws from
+    a 7-word common list ('the','a','an','and','of','to','in'), shuffled.
+    Used for the worst-case performance regression measurement in section
+    2(a) above (150,007 distinct words in Task1 output, 2183 tokens in
+    Task2 output).
+
+Real data used for correctness/perf on Spartan:
+  /data/gpfs/projects/punim0520/2026/project1/{10M,100M,1G,4G,8G,24G}.txt
+  (per course Ed post; "test.txt" mentioned in the Makefile's smoke target
+  does not exist anywhere — that case is currently dead/unreachable).
+  Locked smoke baselines (from the Makefile):
+    test.txt  -> ad9bd56b5593db058f4918864ddad7ae  (file itself missing)
+    10M.txt   -> 437efd507a4ce4ca82956f062fa9c2b2  (confirmed match)
+    100M.txt  -> 3581e913ac4c3f85000e8f8c933c8037  (confirmed match, Task1-
+                  only stage; not yet re-confirmed with real parallel_task2)
+
+
+===========================================================
+4. Open items / TODO before submission
+===========================================================
+- [x] Re-run 100M.txt smoke test with the real parallel_task2 (2026-09-12):
+      md5 matches baseline at both 1 and 8 threads — correctness confirmed,
+      but task2 alone is SLOWER at 8 threads (3267ms -> 3651ms, 0.90x) —
+      see section 2(c). This is worse than the 10M.txt result, so the
+      regression grows with scale.
+- [ ] REQUIRED, not optional anymore: implement the token_count/group_count
+      parallel-phase optimization described in section 2 before doing
+      anything else on Task2 — confirmed on real 100M.txt data that task2
+      as currently implemented would score 0 on the speed rubric.
+- [ ] Sweep OMP_NUM_THREADS = 1/2/4/8/16/32 on 10M.txt and 100M.txt on
+      Spartan for task2 specifically (only have 1 vs 8 on both so far).
+- [ ] Task3: benchmark.slurm SBATCH header is still a placeholder, not filled in.
+- [ ] tests/test_parallel_task2_diff.cpp's RealisticMixedCorpus and
+      DiverseVocabularyCorpus cases depend on external files (stress.txt/
+      stress2.txt) that are NOT in the repo — will fail with "file not
+      found" for anyone else (including graders) who tries to run them.
+      Either commit the corpora under tests/data/ with relative paths, or
+      drop those two test cases and rely on the self-contained ones.
