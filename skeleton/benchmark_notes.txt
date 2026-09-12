@@ -111,6 +111,13 @@ Correctness verification (tests/test_parallel_task2_diff.cpp):
   locked baseline at both 1 and 8 threads (2026-09-12) — correctness holds
   at the larger scale too.
 
+Reproducibility note (2026-09-12): a login-node measurement earlier showed
+task2 speeding up 597ms->444ms (1.34x) on 10M.txt, but that was almost
+certainly noise from a shared login node. On a dedicated sinteractive node
+(spartan-bm003), 10M.txt task2 measured 538ms @1 thread vs 750-1000ms
+@8 threads (repeated several times) -- consistently slower, matching the
+100M.txt finding below. The login-node "win" should not be trusted.
+
 Performance — WARNING, not a clean win yet:
 
   (a) Synthetic worst case, 150,007 distinct words ("wordN" + a handful of
@@ -168,17 +175,49 @@ Performance — WARNING, not a clean win yet:
       both thread counts — correctness still solid, only speed is the
       problem.
 
-Next optimization planned (not yet implemented):
-  Promote token_count increments/decrements and group_count decrements into
-  the parallel phase directly (verified safe: token_count updates are purely
-  additive per token id and can be accumulated as local deltas or done with
-  an atomic; group ids are exclusively owned by one (pair_state, word) pair
-  so decrementing an EXISTING group's count from the owning word's thread
-  never races with another word). Leave only the genuinely cross-word-shared
-  fields — pair.count, pair.word_count, free_head, and new pair_state/
-  vocabulary/group vector growth — in the sequential replay. This should
-  shrink the sequential phase's share of total work and push the speedup
-  curve up, since Amdahl's law is the main thing currently capping it.
+Optimization attempt #1 — token_count via OpenMP reduction (landed, commit
+e95e29d): token_count[left]/[right]/[merged] only ever move by "frequency"
+per successful merge for the same three token ids across a whole round, so
+it's a plain sum — accumulated as an OpenMP `reduction(+:total_frequency)`
+in the parallel structural pass instead of touching state.token_count once
+per event in the sequential replay. Correct (61/61 tests, stress-tested
+1-16 threads). Effect on the 150k-word local synthetic corpus was small
+(~5-10%, e.g. 8-thread task2 508ms -> 500ms) — expected, since token_count
+was never the dominant cost.
+
+Optimization attempt #2 — group_count via resolve/apply split (TRIED AND
+REVERTED, 2026-09-12, not committed): the plan was to split remove_edge
+into resolve_removal() (decrement group_count, safe in parallel because an
+existing group index is exclusively owned by one (pair_state, word) pair)
+and apply_removal() (the cross-word-shared pair.count/word_count/free_head
+tail, kept in the sequential replay). Implemented it, ran the differential
+test suite immediately — ParallelTask2Diff.ManyWordsWithInternalOverlap
+(the "aaaa0".."aaaa6" chained-overlap corpus) aborted.
+  Root cause: resolve_removal clears edge_group[start] immediately, but the
+  matching add_edge call that's supposed to RE-populate edge_group for the
+  merged position is still deferred to the sequential replay phase (add_edge
+  wasn't touched by this change). Within one word, when the SAME round has
+  multiple chained/overlapping occurrences (event N's left_position is the
+  exact position event N-1 just merged), event N's resolve_removal reads
+  edge_group at a position whose edge hasn't been re-established yet — the
+  sequential reference works because remove_edge AND add_edge happen
+  together per occurrence, in order, before moving to the next occurrence;
+  splitting them across "parallel now, sequential later" breaks that
+  invariant for exactly the same class of bug as the original
+  edge_group[right_position] timing bug (see section above), just
+  reappearing in a different spot once add_edge and remove_edge are no
+  longer both fully deferred together.
+  Reverted cleanly (git checkout --) back to the token_count-only version.
+  Real fix would require ALSO moving add_edge's group resolution into the
+  parallel phase so remove+add for one occurrence stay interleaved like the
+  reference — but add_edge's get_word_group relies on a single shared
+  pair.last_word/pair.last_group cache slot per pair_state, which breaks
+  under concurrent access from different words wanting groups for the same
+  pair_state at the same time. Doing this properly needs a per-word-local
+  cache replacing that single-slot cache (and still deferring genuine vector
+  growth — new pair_states/groups — to a controlled point), which is a much
+  bigger restructuring than "promote a decrement", not a small increment.
+  Left as a bigger future task, not attempted again this session.
 
 
 ===========================================================
