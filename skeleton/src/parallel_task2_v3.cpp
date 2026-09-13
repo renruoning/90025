@@ -331,20 +331,6 @@ void build_state(const std::vector<CharSplit>& splits, task2_state& state) {
         throw std::length_error("too many distinct words");
     }
 
-    // Every successful merge round does vocabulary.push_back/token_count.
-    // push_back (see run_merge_loop_parallel); on a 792,067-round real
-    // corpus (1G.txt) that is 792,067 reallocation-amortized growth events
-    // on a std::vector<std::string> and a std::vector<u64>. Reserving a
-    // reasonable guess upfront (final distinct-word count, i.e. one new
-    // token per source word -- generous for real corpora, cheap even when
-    // it undershoots since normal amortized growth still applies beyond
-    // it) removes most of that churn for a fixed, small extra allocation.
-    // Same idea for pair_states, which grows via create_pair_state calls
-    // throughout the merge loop, not just in this function.
-    state.vocabulary.reserve(byte_value_count + splits.size());
-    state.token_count.reserve(byte_value_count + splits.size());
-    state.pair_states.reserve(splits.size());
-
     state.vocabulary.resize(byte_value_count);
     state.token_count.assign(byte_value_count, 0);
     for (u32 value = 1; value < byte_value_count; ++value) {

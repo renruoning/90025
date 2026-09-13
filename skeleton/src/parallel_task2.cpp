@@ -45,6 +45,17 @@ namespace bpe {
         std::int64_t g_surgery_ns = 0;
         std::int64_t g_replay_ns = 0;
         std::uint64_t g_parallel_positions = 0;
+
+        // Diagnostic (2026-09-13): pair_state.positions accumulates
+        // entries lazily (same style as the heap's lazy-deletion) -- a
+        // position recorded for pair (A,B) can go stale (get merged away
+        // by an unrelated round) before this pair is ever selected, and
+        // pair_is_at() is the only thing that notices and skips it. On the
+        // ~791K small rounds that dominate 1G.txt's remaining apply-time
+        // gap (see report.md sec 9/13), quantify how much of that
+        // iteration is wasted on entries that turn out to be stale.
+        std::uint64_t g_seq_positions_seen = 0;
+        std::uint64_t g_seq_positions_stale = 0;
 u64 pack_pair(u32 left, u32 right) {
     return (static_cast<u64>(left) << 32) | static_cast<u64>(right);
 }
@@ -340,6 +351,18 @@ void build_state(const std::vector<CharSplit>& splits, task2_state& state) {
         throw std::length_error("too many distinct words");
     }
 
+    // Every successful merge round does vocabulary.push_back +
+    // token_count.push_back (792,067 times on 1G.txt), and pair_states
+    // grows throughout the merge loop via create_pair_state -- none of
+    // these three were reserved, so they paid normal vector-doubling
+    // reallocation/move overhead as they grew to hundreds of thousands of
+    // entries. Reserve a generous-but-cheap upfront guess (distinct word
+    // count) for each; safe even when the guess undershoots since ordinary
+    // amortized growth still applies beyond it.
+    state.vocabulary.reserve(byte_value_count + splits.size());
+    state.token_count.reserve(byte_value_count + splits.size());
+    state.pair_states.reserve(splits.size());
+
     state.vocabulary.resize(byte_value_count);
     state.token_count.assign(byte_value_count, 0);
     for (u32 value = 1; value < byte_value_count; ++value) {
@@ -451,8 +474,10 @@ struct MergeEvent{
 void process_positions_sequential(task2_state& state, const std::vector<u32>& positions, u32 left_token, u32 right_token, u32 merged_token) {
     u32 current_word = no_position;
     u64 frequency = 0;
+    g_seq_positions_seen += positions.size();
     for (u32 position : positions) {
         if (!pair_is_at(state, position, left_token, right_token)) {
+            ++g_seq_positions_stale;
             continue;
         }
         const u32 right_position = state.next[position];
@@ -715,6 +740,14 @@ void run_merge_loop_parallel(task2_state& state) {
               << " select(pop+push_born)=" << (select_ns / 1000000) << " ms"
               << " apply(process_positions)=" << (apply_ns / 1000000)
               << " ms";
+    LOG(INFO) << "task2 sequential-path staleness: positions_seen="
+              << g_seq_positions_seen
+              << " stale_and_skipped=" << g_seq_positions_stale
+              << " (" << (g_seq_positions_seen > 0
+                              ? (100.0 * static_cast<double>(g_seq_positions_stale) /
+                                 static_cast<double>(g_seq_positions_seen))
+                              : 0.0)
+              << "%)";
     LOG(INFO) << "task2 parallel-round breakdown: positions="
               << g_parallel_positions
               << " surgery(bucket+splice, no merge step)="
