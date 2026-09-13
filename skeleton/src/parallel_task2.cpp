@@ -22,6 +22,17 @@ namespace bpe {
         constexpr u32 no_position = std::numeric_limits<u32>::max();
         constexpr u32 byte_value_count = 256;
         constexpr std::size_t kParallelThreshold = 20000;
+        // Below this size, compacting pair.positions in pop_best_state
+        // (see below) costs more than it can possibly save: a pair_state
+        // that gets popped-and-requeued many times before final selection
+        // pays a full O(size) remove_if/erase on every requeue, and for a
+        // small vector that's not worth it even if every entry turns out
+        // stale. Measured net-neutral (select's added cost roughly
+        // canceled apply's saving) on 1G.txt without this guard; the guard
+        // targets the case that made compaction win in isolation (large,
+        // long-lived pair_states) without paying its cost on the much more
+        // numerous small ones.
+        constexpr std::size_t kCompactionThreshold = 256;
 
         // Temporary profiling accumulators (2026-09-13): split
         // process_positions_parallel's own time into its three phases --
@@ -353,15 +364,17 @@ u32 pop_best_state(task2_state& state, queue_heap& queue) {
             // process_positions_sequential/parallel use, alive/token
             // transitions are one-directional (never revert), so nothing
             // removed here could become valid again later.
-            const u32 left_token = pair_left(pair.key);
-            const u32 right_token = pair_right(pair.key);
-            std::vector<u32>& positions = pair.positions;
-            positions.erase(
-                std::remove_if(positions.begin(), positions.end(),
-                               [&state, left_token, right_token](u32 position) {
-                                   return !pair_is_at(state, position, left_token, right_token);
-                               }),
-                positions.end());
+            if (pair.positions.size() > kCompactionThreshold) {
+                const u32 left_token = pair_left(pair.key);
+                const u32 right_token = pair_right(pair.key);
+                std::vector<u32>& positions = pair.positions;
+                positions.erase(
+                    std::remove_if(positions.begin(), positions.end(),
+                                   [&state, left_token, right_token](u32 position) {
+                                       return !pair_is_at(state, position, left_token, right_token);
+                                   }),
+                    positions.end());
+            }
             queue.push(queue_entry{pair.count, pair.fingerprint, entry.state});
             continue;
         }
