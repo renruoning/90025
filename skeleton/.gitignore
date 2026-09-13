@@ -1,6 +1,9 @@
 # Claude Code session state (not part of the submission)
 .claude/
 
+# Working log of the Task2 optimization journey (not part of the submission)
+report.md
+
 # Build artifacts (rule R8.1: not part of the submission)
 build/
 build-cov/
