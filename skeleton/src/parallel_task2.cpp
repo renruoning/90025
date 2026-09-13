@@ -30,9 +30,18 @@ namespace bpe {
         // slowdown observed on 1G.txt (591 rounds went parallel there,
         // apply time 13527ms @1 thread vs 30581ms @8 threads). Remove
         // before submission if not otherwise useful.
-        std::int64_t g_bucket_ns = 0;
-        std::int64_t g_bucket_scan_ns = 0;
-        std::uint64_t g_bucket_merge_entries = 0;
+        // g_bucket_ns held the cost of bucketing positions by word: first a
+        // chunk+thread-local-map+ordered-merge design (11521ms -> 8067ms on
+        // 1G.txt's 591 large rounds), then profiling that fix itself showed
+        // the ordered merge was still doing ~49M single-entry hash-map
+        // touches (scan=2079ms, merge=5987ms, merge_entries=48776504 out of
+        // 49996105 total positions) -- these large rounds have close to one
+        // occurrence per distinct word, so almost nothing to merge, and the
+        // merge step ends up repeating most of the original single-threaded
+        // work. Fix: partition by word ownership (word % num_threads) up
+        // front so each thread's local map is already final -- bucketing
+        // and surgery now happen together in one parallel region with no
+        // merge step at all. See process_positions_parallel.
         std::int64_t g_surgery_ns = 0;
         std::int64_t g_replay_ns = 0;
         std::uint64_t g_parallel_positions = 0;
@@ -490,95 +499,50 @@ void process_positions_sequential(task2_state& state, const std::vector<u32>& po
 }
 
 void process_positions_parallel(task2_state& state, const std::vector<u32>& positions, u32 left_token, u32 right_token, u32 merged_token) {
-    const auto bucket_t0 = std::chrono::steady_clock::now();
-    // Bucketing positions by word was profiled as the dominant cost of a
-    // large round (65% of a large round's total time on 1G.txt, 11.5s out
-    // of 17.7s, dwarfing the actually-parallel surgery phase's 2s) --
-    // because it was a single-threaded O(positions) hash-map build. Fix:
-    // same chunk + thread-local-map + ordered-merge pattern already used
-    // for word counting in parallel_task1 (src/parallel.cpp). Each thread
-    // scans a contiguous slice of `positions` (preserving left-to-right
-    // order within that slice) into its own local map; merging the P local
-    // maps in thread-rank order for each word preserves the original
-    // left-to-right occurrence order overall, which process_positions_*'s
-    // left-to-right exhaustive merge (rule R5.4) depends on.
+    // Own each position's word by (word % num_threads) up front, instead of
+    // splitting `positions` into contiguous index chunks. A large round's
+    // positions accumulate across many prior rounds' add_edge calls, so
+    // they are not grouped by word at all -- contiguous chunking meant a
+    // word's occurrences landed in whichever chunks they happened to fall
+    // in (up to one fragment per thread), and 591 large rounds on 1G.txt
+    // turned out to have close to one occurrence per distinct word (49.9M
+    // positions, 48.8M single-entry thread/word fragments) -- so the
+    // merge step that combined fragments back into one shared map was
+    // doing almost as much hash-map work as the original single-threaded
+    // bucketing it replaced. Owning by word%P instead means each thread's
+    // local map is already complete and final: no merge, no shared map,
+    // and bucketing + surgery can run in the same parallel region.
     const int num_threads = omp_get_max_threads();
-    std::vector<std::unordered_map<u32, std::vector<u32>>> local_by_word(
+    const u32 num_threads_u32 = static_cast<u32>(num_threads);
+    std::vector<std::vector<MergeEvent>> local_events(
         static_cast<std::size_t>(num_threads));
-    const std::size_t n = positions.size();
-    const auto scan_t0 = std::chrono::steady_clock::now();
-    #pragma omp parallel
-    {
-        const int tid = omp_get_thread_num();
-        const std::size_t chunk =
-            (n + static_cast<std::size_t>(num_threads) - 1) /
-            static_cast<std::size_t>(num_threads);
-        const std::size_t lo =
-            std::min(n, static_cast<std::size_t>(tid) * chunk);
-        const std::size_t hi = std::min(n, lo + chunk);
-        std::unordered_map<u32, std::vector<u32>>& mine = local_by_word[tid];
-        mine.reserve((hi - lo) / 4 + 16);
-        for (std::size_t i = lo; i < hi; ++i) {
-            const u32 position = positions[i];
-            mine[state.word_of[position]].push_back(position);
-        }
-    }
-    const auto scan_t1 = std::chrono::steady_clock::now();
-    g_bucket_scan_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            scan_t1 - scan_t0)
-                            .count();
-
-    std::size_t distinct_words_this_round = 0;
-    for (const auto& local : local_by_word) {
-        distinct_words_this_round += local.size();
-    }
-    g_bucket_merge_entries += distinct_words_this_round;
-
-    std::unordered_map<u32, std::vector<u32>> by_word;
-    by_word.reserve(positions.size() / 4 + 16);
-    for (std::unordered_map<u32, std::vector<u32>>& local : local_by_word) {
-        for (auto& entry : local) {
-            std::vector<u32>& dest = by_word[entry.first];
-            if (dest.empty()) {
-                dest = std::move(entry.second);
-            } else {
-                dest.insert(dest.end(), entry.second.begin(),
-                           entry.second.end());
-            }
-        }
-    }
-    std::vector<u32> active_words;
-    active_words.reserve(by_word.size());
-    for(const auto& entry:by_word){
-        active_words.push_back(entry.first);
-    }
-    const auto bucket_t1 = std::chrono::steady_clock::now();
-    g_bucket_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                       bucket_t1 - bucket_t0)
-                       .count();
     g_parallel_positions += positions.size();
 
-    std::vector<std::vector<MergeEvent>> local_events(num_threads);
-
-    // token_count[left_token]/[right_token]/[merged_token] only ever move by
-    // "frequency" per successful merge, for the same three token ids for the
-    // whole round -- that's a plain sum, safe to accumulate as an OpenMP
-    // reduction instead of touching the shared state.token_count array once
-    // per event in the sequential replay below.
     u64 total_frequency = 0;
-
     const auto surgery_t0 = std::chrono::steady_clock::now();
-    #pragma omp parallel
+    #pragma omp parallel reduction(+:total_frequency)
     {
         const int tid = omp_get_thread_num();
-        std::vector<MergeEvent>& events = local_events[tid];
-        events.reserve(positions.size() / static_cast<std::size_t>(num_threads) + 16);
+        const u32 tid_u32 = static_cast<u32>(tid);
 
-        #pragma omp for schedule(dynamic, 64) reduction(+:total_frequency)
-        for (std::size_t idx = 0; idx < active_words.size(); ++idx) {
-            const u32 word = active_words[idx];
+        std::unordered_map<u32, std::vector<u32>> mine_by_word;
+        mine_by_word.reserve(
+            positions.size() / static_cast<std::size_t>(num_threads) / 2 +
+            16);
+        for (u32 position : positions) {
+            const u32 word = state.word_of[position];
+            if (word % num_threads_u32 == tid_u32) {
+                mine_by_word[word].push_back(position);
+            }
+        }
+
+        std::vector<MergeEvent>& events = local_events[tid];
+        events.reserve(mine_by_word.size() * 2 + 16);
+
+        for (const auto& entry : mine_by_word) {
+            const u32 word = entry.first;
             const u64 frequency = state.word_frequencies[word];
-            for (u32 position : by_word.at(word)) {
+            for (u32 position : entry.second) {
                 if (!pair_is_at(state, position, left_token, right_token)) {
                     continue;
                 }
@@ -753,11 +717,8 @@ void run_merge_loop_parallel(task2_state& state) {
               << " ms";
     LOG(INFO) << "task2 parallel-round breakdown: positions="
               << g_parallel_positions
-              << " bucket=" << (g_bucket_ns / 1000000) << " ms"
-              << " (scan=" << (g_bucket_scan_ns / 1000000) << " ms"
-              << " merge=" << ((g_bucket_ns - g_bucket_scan_ns) / 1000000)
-              << " ms, merge_entries=" << g_bucket_merge_entries << ")"
-              << " surgery=" << (g_surgery_ns / 1000000) << " ms"
+              << " surgery(bucket+splice, no merge step)="
+              << (g_surgery_ns / 1000000) << " ms"
               << " replay=" << (g_replay_ns / 1000000) << " ms";
 }
 
