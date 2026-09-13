@@ -31,6 +31,8 @@ namespace bpe {
         // apply time 13527ms @1 thread vs 30581ms @8 threads). Remove
         // before submission if not otherwise useful.
         std::int64_t g_bucket_ns = 0;
+        std::int64_t g_bucket_scan_ns = 0;
+        std::uint64_t g_bucket_merge_entries = 0;
         std::int64_t g_surgery_ns = 0;
         std::int64_t g_replay_ns = 0;
         std::uint64_t g_parallel_positions = 0;
@@ -504,6 +506,7 @@ void process_positions_parallel(task2_state& state, const std::vector<u32>& posi
     std::vector<std::unordered_map<u32, std::vector<u32>>> local_by_word(
         static_cast<std::size_t>(num_threads));
     const std::size_t n = positions.size();
+    const auto scan_t0 = std::chrono::steady_clock::now();
     #pragma omp parallel
     {
         const int tid = omp_get_thread_num();
@@ -520,6 +523,16 @@ void process_positions_parallel(task2_state& state, const std::vector<u32>& posi
             mine[state.word_of[position]].push_back(position);
         }
     }
+    const auto scan_t1 = std::chrono::steady_clock::now();
+    g_bucket_scan_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            scan_t1 - scan_t0)
+                            .count();
+
+    std::size_t distinct_words_this_round = 0;
+    for (const auto& local : local_by_word) {
+        distinct_words_this_round += local.size();
+    }
+    g_bucket_merge_entries += distinct_words_this_round;
 
     std::unordered_map<u32, std::vector<u32>> by_word;
     by_word.reserve(positions.size() / 4 + 16);
@@ -741,6 +754,9 @@ void run_merge_loop_parallel(task2_state& state) {
     LOG(INFO) << "task2 parallel-round breakdown: positions="
               << g_parallel_positions
               << " bucket=" << (g_bucket_ns / 1000000) << " ms"
+              << " (scan=" << (g_bucket_scan_ns / 1000000) << " ms"
+              << " merge=" << ((g_bucket_ns - g_bucket_scan_ns) / 1000000)
+              << " ms, merge_entries=" << g_bucket_merge_entries << ")"
               << " surgery=" << (g_surgery_ns / 1000000) << " ms"
               << " replay=" << (g_replay_ns / 1000000) << " ms";
 }
