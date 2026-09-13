@@ -1,10 +1,6 @@
-// Scratch differential test: verifies parallel_task2_v1 (the original
-// group/free-list design, see src/parallel_task2.cpp) produces byte-identical
+// Scratch differential test: verifies parallel_task2 produces byte-identical
 // Results to the sequential task2 reference, including a large synthetic
 // corpus designed to exercise the parallel (word-bucketed) code path.
-// parallel_task2_v1 is no longer wired into the real bpe::parallel_task2
-// entry point (see src/parallel_task2_v3.cpp), kept here as a regression
-// test in case v1 is revisited.
 // Not part of the graded suite -- delete before submitting if not wanted.
 
 #include "bpe.h"
@@ -14,10 +10,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-
-namespace bpe {
-void parallel_task2_v1(const std::vector<CharSplit>& splits, Results& results);
-}  // namespace bpe
 
 namespace {
 
@@ -39,7 +31,7 @@ void expect_same(const std::vector<bpe::CharSplit>& splits) {
     bpe::Results seq;
     bpe::task2(splits, seq);
     bpe::Results par;
-    bpe::parallel_task2_v1(splits, par);
+    bpe::parallel_task2(splits, par);
     EXPECT_EQ(tokens_of(seq), tokens_of(par));
 }
 

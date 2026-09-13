@@ -751,19 +751,13 @@ void finalize_results(const task2_state& state, Results& results) {
 
 }  // namespace
 
+// Not wired into the real parallel_task2 entry point -- kept separate so
+// the existing, verified parallel_task2.cpp is untouched.
 void parallel_task2_v3(const std::vector<CharSplit>& splits, Results& results) {
     task2_state state;
     build_state(splits, state);
     run_merge_loop_parallel(state);
     finalize_results(state, results);
-}
-
-// Real entry point declared in bpe.h and called from pipeline.cpp. Wired to
-// v3 (batched own-pair removal) after v1 (src/parallel_task2.cpp, still kept
-// as parallel_task2_v1 for its differential test) was confirmed to regress
-// on real Spartan data (100M.txt: 0.74x at 8 threads, 2026-09-13).
-void parallel_task2(const std::vector<CharSplit>& splits, Results& results) {
-    parallel_task2_v3(splits, results);
 }
 
 }  // namespace bpe
