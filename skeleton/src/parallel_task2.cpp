@@ -333,35 +333,11 @@ u32 pop_best_state(task2_state& state, queue_heap& queue) {
     while (!queue.empty()) {
         const queue_entry entry = queue.top();
         queue.pop();
-        pair_state& pair = state.pair_states[entry.state];
+        const pair_state& pair = state.pair_states[entry.state];
         if (pair.word_count < 2 || pair.count == 0) {
             continue;
         }
         if (entry.count != pair.count) {
-            // remove_edge() only decrements counters (group_count/
-            // pair.count) -- it never erases the specific position from
-            // pair.positions, since finding it in an unsorted vector
-            // would be O(n) per removal (see report.md sec 12d for the
-            // measured cost: 51-57% of positions iterated in the final
-            // processing loop turn out to be exactly this kind of stale
-            // leftover). This branch means we already know this
-            // pair_state's cached count is out of date -- while we're
-            // here anyway, filter out anything that pair_is_at() would
-            // reject at final processing time too, so a later requeue (or
-            // the eventual real selection) scans a smaller list. Safe by
-            // construction: pair_is_at() is the exact same predicate
-            // process_positions_sequential/parallel use, alive/token
-            // transitions are one-directional (never revert), so nothing
-            // removed here could become valid again later.
-            const u32 left_token = pair_left(pair.key);
-            const u32 right_token = pair_right(pair.key);
-            std::vector<u32>& positions = pair.positions;
-            positions.erase(
-                std::remove_if(positions.begin(), positions.end(),
-                               [&state, left_token, right_token](u32 position) {
-                                   return !pair_is_at(state, position, left_token, right_token);
-                               }),
-                positions.end());
             queue.push(queue_entry{pair.count, pair.fingerprint, entry.state});
             continue;
         }
