@@ -489,10 +489,50 @@ void process_positions_sequential(task2_state& state, const std::vector<u32>& po
 
 void process_positions_parallel(task2_state& state, const std::vector<u32>& positions, u32 left_token, u32 right_token, u32 merged_token) {
     const auto bucket_t0 = std::chrono::steady_clock::now();
+    // Bucketing positions by word was profiled as the dominant cost of a
+    // large round (65% of a large round's total time on 1G.txt, 11.5s out
+    // of 17.7s, dwarfing the actually-parallel surgery phase's 2s) --
+    // because it was a single-threaded O(positions) hash-map build. Fix:
+    // same chunk + thread-local-map + ordered-merge pattern already used
+    // for word counting in parallel_task1 (src/parallel.cpp). Each thread
+    // scans a contiguous slice of `positions` (preserving left-to-right
+    // order within that slice) into its own local map; merging the P local
+    // maps in thread-rank order for each word preserves the original
+    // left-to-right occurrence order overall, which process_positions_*'s
+    // left-to-right exhaustive merge (rule R5.4) depends on.
+    const int num_threads = omp_get_max_threads();
+    std::vector<std::unordered_map<u32, std::vector<u32>>> local_by_word(
+        static_cast<std::size_t>(num_threads));
+    const std::size_t n = positions.size();
+    #pragma omp parallel
+    {
+        const int tid = omp_get_thread_num();
+        const std::size_t chunk =
+            (n + static_cast<std::size_t>(num_threads) - 1) /
+            static_cast<std::size_t>(num_threads);
+        const std::size_t lo =
+            std::min(n, static_cast<std::size_t>(tid) * chunk);
+        const std::size_t hi = std::min(n, lo + chunk);
+        std::unordered_map<u32, std::vector<u32>>& mine = local_by_word[tid];
+        mine.reserve((hi - lo) / 4 + 16);
+        for (std::size_t i = lo; i < hi; ++i) {
+            const u32 position = positions[i];
+            mine[state.word_of[position]].push_back(position);
+        }
+    }
+
     std::unordered_map<u32, std::vector<u32>> by_word;
-    by_word.reserve(positions.size());
-    for (u32 position : positions) {
-        by_word[state.word_of[position]].push_back(position);
+    by_word.reserve(positions.size() / 4 + 16);
+    for (std::unordered_map<u32, std::vector<u32>>& local : local_by_word) {
+        for (auto& entry : local) {
+            std::vector<u32>& dest = by_word[entry.first];
+            if (dest.empty()) {
+                dest = std::move(entry.second);
+            } else {
+                dest.insert(dest.end(), entry.second.begin(),
+                           entry.second.end());
+            }
+        }
     }
     std::vector<u32> active_words;
     active_words.reserve(by_word.size());
@@ -505,7 +545,6 @@ void process_positions_parallel(task2_state& state, const std::vector<u32>& posi
                        .count();
     g_parallel_positions += positions.size();
 
-    const int num_threads=omp_get_max_threads();
     std::vector<std::vector<MergeEvent>> local_events(num_threads);
 
     // token_count[left_token]/[right_token]/[merged_token] only ever move by
