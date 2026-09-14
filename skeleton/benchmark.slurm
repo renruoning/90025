@@ -3,7 +3,7 @@
 #SBATCH --partition=sapphire
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
-#SBATCH --time=04:00:00
+#SBATCH --time=00:30:00
 #SBATCH --exclusive
 
 set -euo pipefail
