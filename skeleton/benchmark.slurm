@@ -12,7 +12,7 @@ DATA_DIR="/data/gpfs/projects/punim0520/2026/project1"
 if [ "$#" -gt 0 ]; then
   INPUTS=("$@")
 else
-  INPUTS=("$DATA_DIR/10M.txt" "$DATA_DIR/100M.txt" "$DATA_DIR/1G.txt")
+  INPUTS=("$DATA_DIR/10M.txt" "$DATA_DIR/100M.txt" "$DATA_DIR/1G.txt" "$DATA_DIR/4G.txt")
 fi
 THREADS="${THREADS:-1 2 4 8 16 32}"
 
