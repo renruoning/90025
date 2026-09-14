@@ -84,7 +84,23 @@ struct pair_state {
     u64 key = 0;
     u64 count = 0;
     u32 word_count = 0;
-    std::vector<u32> positions;
+    // Intrusive doubly-linked list of this pair's currently-live member
+    // positions, threaded through task2_state::pos_prev_in_pair/
+    // pos_next_in_pair (indexed by position, not by pair -- one shared
+    // pair of arrays for every pair_state, not a per-pair_state vector).
+    // Replaces a std::vector<u32> `positions` that grew via push_back in
+    // add_edge but was never shrunk by remove_edge (finding/erasing a
+    // specific value in an unsorted vector is O(n)) -- measured as 51-57%
+    // dead weight at final-processing time on real 1G.txt/100M.txt data
+    // (see report.md). A linked list makes removal a true O(1) unlink
+    // with no wasted rescanning, and -- critically -- preserves the
+    // left-to-right relative order of same-word entries that R5.4's
+    // exhaustive overlapping-merge rule depends on (unlike a vector
+    // swap-remove, which would scramble it: verified by hand-tracing the
+    // PDF's own (a,a,a)->(aa,a) example against a swapped order, which
+    // produces the wrong (a,aa) instead -- see report.md for the trace).
+    u32 positions_head = no_position;
+    u32 positions_tail = no_position;
     u32 last_word = no_position;
     u32 last_group = no_position;
     u64 fingerprint = 0;
@@ -169,6 +185,11 @@ struct task2_state {
     std::vector<u32> next;
     std::vector<u32> word_of;
     std::vector<u32> edge_group;
+    // Threads pair_state::positions_head/positions_tail (see pair_state)
+    // -- indexed by position, shared across every pair_state, sized like
+    // token/previous/next/word_of/edge_group.
+    std::vector<u32> pos_prev_in_pair;
+    std::vector<u32> pos_next_in_pair;
     std::vector<u8> alive;
     std::vector<u64> token_count;
     std::vector<std::string> vocabulary;
@@ -205,6 +226,35 @@ bool queue_compare::operator()(const queue_entry& left,
 
 bool is_live(const task2_state& state, u32 position) {
     return position != no_position && state.alive[position] != 0;
+}
+
+// Append `position` to the end of `pair`'s live-member list. O(1).
+void link_append(task2_state& state, pair_state& pair, u32 position) {
+    state.pos_prev_in_pair[position] = pair.positions_tail;
+    state.pos_next_in_pair[position] = no_position;
+    if (pair.positions_tail != no_position) {
+        state.pos_next_in_pair[pair.positions_tail] = position;
+    } else {
+        pair.positions_head = position;
+    }
+    pair.positions_tail = position;
+}
+
+// Unlink `position` from `pair`'s live-member list, wherever it is. O(1),
+// and leaves every other member's relative order untouched.
+void link_remove(task2_state& state, pair_state& pair, u32 position) {
+    const u32 prev = state.pos_prev_in_pair[position];
+    const u32 next = state.pos_next_in_pair[position];
+    if (prev != no_position) {
+        state.pos_next_in_pair[prev] = next;
+    } else {
+        pair.positions_head = next;
+    }
+    if (next != no_position) {
+        state.pos_prev_in_pair[next] = prev;
+    } else {
+        pair.positions_tail = prev;
+    }
 }
 
 u32 create_pair_state(task2_state& state, u64 key) {
@@ -279,6 +329,7 @@ void remove_edge(task2_state& state, u32 start, u64 frequency) {
         std::abort();
     }
     pair_state& pair = state.pair_states[state.group_state[group]];
+    link_remove(state, pair, start);
     --state.group_count[group];
     if (pair.count < frequency) {
         std::abort();
@@ -307,7 +358,7 @@ void add_edge(task2_state& state, u32 start, u32 state_id, u32 word,
         ++pair.word_count;
     }
     pair.count += frequency;
-    pair.positions.push_back(start);
+    link_append(state, pair, start);
     state.edge_group[start] = group;
 }
 
@@ -382,6 +433,8 @@ void build_state(const std::vector<CharSplit>& splits, task2_state& state) {
     state.next.reserve(slot_count);
     state.word_of.reserve(slot_count);
     state.edge_group.reserve(slot_count);
+    state.pos_prev_in_pair.reserve(slot_count);
+    state.pos_next_in_pair.reserve(slot_count);
     state.alive.reserve(slot_count);
     state.group_state.reserve(slot_count);
     state.group_count.reserve(slot_count);
@@ -404,6 +457,8 @@ void build_state(const std::vector<CharSplit>& splits, task2_state& state) {
             state.next.push_back(position + 1);
             state.word_of.push_back(word);
             state.edge_group.push_back(no_position);
+            state.pos_prev_in_pair.push_back(no_position);
+            state.pos_next_in_pair.push_back(no_position);
             state.alive.push_back(1);
             state.token_count[value] += split.count;
         }
@@ -415,6 +470,8 @@ void build_state(const std::vector<CharSplit>& splits, task2_state& state) {
         state.next.push_back(no_position);
         state.word_of.push_back(word);
         state.edge_group.push_back(no_position);
+        state.pos_prev_in_pair.push_back(no_position);
+        state.pos_next_in_pair.push_back(no_position);
         state.alive.push_back(0);
 
         if (split.chars.empty()) {
@@ -447,7 +504,7 @@ void build_state(const std::vector<CharSplit>& splits, task2_state& state) {
             }
             ++state.group_count[group];
             pair.count += split.count;
-            pair.positions.push_back(position);
+            link_append(state, pair, position);
             state.edge_group[position] = group;
         }
     }
@@ -687,8 +744,23 @@ void run_merge_loop_parallel(task2_state& state) {
         }
 
         const u64 best_key = state.pair_states[best_state].key;
-        std::vector<u32> positions =
-            std::move(state.pair_states[best_state].positions);
+        // Materialize the linked list into a vector for
+        // process_positions_sequential/parallel (unchanged downstream
+        // signatures). Unlike the old std::vector<u32>::positions this
+        // walks ONLY live members -- no stale entries ever accumulate in
+        // the list in the first place, since remove_edge unlinks them
+        // immediately (O(1), see link_remove) instead of leaving them for
+        // a later scan to skip.
+        std::vector<u32> positions;
+        {
+            pair_state& best_pair = state.pair_states[best_state];
+            for (u32 p = best_pair.positions_head; p != no_position;
+                 p = state.pos_next_in_pair[p]) {
+                positions.push_back(p);
+            }
+            best_pair.positions_head = no_position;
+            best_pair.positions_tail = no_position;
+        }
         const u32 left_token = pair_left(best_key);
         const u32 right_token = pair_right(best_key);
         const u32 merged_token = static_cast<u32>(state.vocabulary.size());
